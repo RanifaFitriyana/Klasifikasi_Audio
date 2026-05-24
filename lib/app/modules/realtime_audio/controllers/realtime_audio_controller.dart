@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:typed_data';
-
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -8,312 +7,164 @@ import 'package:record/record.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 
 class RealtimeAudioController extends GetxController {
-  final AudioRecorder _audioRecorder = AudioRecorder();
-
+  final _audioRecorder = AudioRecorder();
   StreamSubscription<Uint8List>? _audioStreamSubscription;
-
   Interpreter? _interpreter;
-
   List<String> _labels = [];
 
   final isRecording = false.obs;
-
-  final predictedLabel = "Loading model...".obs;
-
+  final predictedLabel = "Loading...".obs;
   final confidence = 0.0.obs;
+  final labelProbabilities = <String, double>{}.obs;
 
-  static const int sampleRate = 16000;
-
-  static const int expectedInputSize = 15600;
-
-  List<int> audioBuffer = [];
-
-  bool isInferencing = false;
-
-  Timer? debounceTimer;
-
-  // =========================================================
-  // INIT
-  // =========================================================
+  static const int _sampleRate = 44100;
+  static const int _expectedInputSize = 44032;
+  
+  List<int> _audioBuffer = [];
 
   @override
   void onInit() {
     super.onInit();
-    loadModelAndLabels();
+    _loadModelAndLabels();
   }
-
-  // =========================================================
-  // DISPOSE
-  // =========================================================
 
   @override
   void onClose() {
-    stopRecording();
-
+    _stopRecording();
     _audioRecorder.dispose();
-
     _interpreter?.close();
-
-    debounceTimer?.cancel();
-
     super.onClose();
   }
 
-  // =========================================================
-  // LOAD MODEL
-  // =========================================================
-
-  Future<void> loadModelAndLabels() async {
+  Future<void> _loadModelAndLabels() async {
     try {
-      // LOAD LABELS
-      final labelData =
-          await rootBundle.loadString('assets/ml/labels.txt');
-
+      final labelData = await rootBundle.loadString('assets/ml/labels.txt');
       _labels = labelData
           .split('\n')
-          .where((line) => line.trim().isNotEmpty)
-          .map((line) {
-        final parts = line.split(' ');
+          .map((line) => line.trim())
+          .where((line) => line.isNotEmpty)
+          .map((line) => line.split(' ').sublist(1).join(' '))
+          .toList();
 
-        if (parts.length > 1) {
-          return parts.sublist(1).join(' ');
-        }
-
-        return line;
-      }).toList();
-
-      // LOAD MODEL
-      _interpreter = await Interpreter.fromAsset(
-        'assets/ml/soundclassifier_with_metadata.tflite',
-      );
-
+      _interpreter = await Interpreter.fromAsset('assets/ml/soundclassifier_with_metadata.tflite');
       predictedLabel.value = "Ready to record";
+      for (var label in _labels) {
+        labelProbabilities[label] = 0.0;
+      }
     } catch (e) {
-      predictedLabel.value = "Failed to load model";
-
-      print("MODEL ERROR: $e");
+      predictedLabel.value = "Failed to load model: $e";
     }
   }
-
-  // =========================================================
-  // TOGGLE RECORD
-  // =========================================================
 
   Future<void> toggleRecording() async {
     if (isRecording.value) {
-      await stopRecording();
+      await _stopRecording();
     } else {
-      await startRecording();
+      await _startRecording();
     }
   }
 
-  // =========================================================
-  // START RECORD
-  // =========================================================
-
-  Future<void> startRecording() async {
+  Future<void> _startRecording() async {
     try {
-      final micPermission =
-          await Permission.microphone.request();
-
-      if (!micPermission.isGranted) {
-        predictedLabel.value =
-            "Microphone permission denied";
-
+      var status = await Permission.microphone.request();
+      if (status != PermissionStatus.granted) {
+        predictedLabel.value = "Microphone permission denied";
         return;
       }
 
-      if (!await _audioRecorder.hasPermission()) {
-        predictedLabel.value =
-            "Recorder permission denied";
-
-        return;
-      }
-
-      final stream =
-          await _audioRecorder.startStream(
-        const RecordConfig(
+      if (await _audioRecorder.hasPermission()) {
+        final stream = await _audioRecorder.startStream(const RecordConfig(
           encoder: AudioEncoder.pcm16bits,
-          sampleRate: sampleRate,
+          sampleRate: _sampleRate,
           numChannels: 1,
-        ),
-      );
+        ));
 
-      // RESET
-      audioBuffer.clear();
+        _audioBuffer.clear();
+        isRecording.value = true;
+        predictedLabel.value = "Listening...";
 
-      confidence.value = 0.0;
-
-      predictedLabel.value = "Listening...";
-
-      isRecording.value = true;
-
-      // LISTEN AUDIO STREAM
-      _audioStreamSubscription =
-          stream.listen(
-        processAudioData,
-        onError: (e) {
-          predictedLabel.value =
-              "Stream Error";
-
-          print("STREAM ERROR: $e");
-        },
-      );
-    } catch (e) {
-      predictedLabel.value =
-          "Error starting record";
-
-      print("START RECORD ERROR: $e");
-    }
-  }
-
-  // =========================================================
-  // STOP RECORD
-  // =========================================================
-
-  Future<void> stopRecording() async {
-    try {
-      await _audioStreamSubscription?.cancel();
-
-      _audioStreamSubscription = null;
-
-      await _audioRecorder.stop();
-
-      debounceTimer?.cancel();
-
-      isRecording.value = false;
-
-      // JANGAN RESET HASIL
-      // predictedLabel.value = "Ready to record";
-
-      // confidence.value = 0.0;
-    } catch (e) {
-      print("STOP ERROR: $e");
-    }
-  }
-
-  // =========================================================
-  // PROCESS AUDIO
-  // =========================================================
-
-  void processAudioData(Uint8List data) {
-    try {
-      // PCM 16 BIT
-      Int16List int16Data = data.buffer.asInt16List(
-        data.offsetInBytes,
-        data.lengthInBytes ~/ 2,
-      );
-
-      audioBuffer.addAll(int16Data);
-
-      // BUFFER CUKUP
-      if (audioBuffer.length >= expectedInputSize) {
-        // AMBIL WINDOW TERAKHIR
-        List<int> samples = audioBuffer.sublist(
-          audioBuffer.length - expectedInputSize,
-        );
-
-        // BUFFER SHIFT
-        audioBuffer = audioBuffer.sublist(
-          audioBuffer.length - (expectedInputSize ~/ 2),
-        );
-
-        // DEBOUNCE
-        debounceTimer?.cancel();
-
-        debounceTimer = Timer(
-          const Duration(milliseconds: 300),
-          () {
-            runInference(samples);
-          },
-        );
+        _audioStreamSubscription = stream.listen((Uint8List data) {
+          _processAudioData(data);
+        });
       }
     } catch (e) {
-      print("PROCESS AUDIO ERROR: $e");
+      predictedLabel.value = "Error starting record: $e";
     }
   }
 
-  // =========================================================
-  // RUN INFERENCE
-  // =========================================================
+  Future<void> _stopRecording() async {
+    await _audioStreamSubscription?.cancel();
+    _audioStreamSubscription = null;
+    await _audioRecorder.stop();
+    isRecording.value = false;
+    predictedLabel.value = "Ready to record";
+    confidence.value = 0.0;
+  }
 
-  Future<void> runInference(
-    List<int> pcmData,
-  ) async {
-    if (_interpreter == null) return;
+  void _processAudioData(Uint8List data) {
+    Int16List int16Data;
+    if (data.offsetInBytes % 2 == 0) {
+      int16Data = data.buffer.asInt16List(data.offsetInBytes, data.lengthInBytes ~/ 2);
+    } else {
+      final alignedData = Uint8List.fromList(data);
+      int16Data = alignedData.buffer.asInt16List(0, alignedData.lengthInBytes ~/ 2);
+    }
+    _audioBuffer.addAll(int16Data);
 
-    if (_labels.isEmpty) return;
+    if (_audioBuffer.length >= _expectedInputSize) {
+      List<int> samplesToProcess = _audioBuffer.sublist(_audioBuffer.length - _expectedInputSize);
+      _audioBuffer = _audioBuffer.sublist(_audioBuffer.length - (_expectedInputSize ~/ 2));
+      _runInference(samplesToProcess);
+    }
+  }
 
-    if (isInferencing) return;
+  void _runInference(List<int> pcmData) {
+    if (_interpreter == null || _labels.isEmpty) return;
+
+    // Input: Float32List to guarantee native 32-bit float layout alignment (avoids NaN).
+    Float32List inputBuffer = Float32List(pcmData.length);
+    for (int i = 0; i < pcmData.length; i++) {
+      inputBuffer[i] = pcmData[i] / 32768.0;
+    }
 
     try {
-      isInferencing = true;
-
-      // NORMALIZE AUDIO
-      List<double> normalized = pcmData
-          .map((e) => e / 32768.0)
-          .toList();
-
-      // INPUT SHAPE
-      var input = [normalized];
-
-      // OUTPUT
-      var output = List.generate(
-        1,
-        (_) => List.filled(
-          _labels.length,
-          0.0,
-        ),
+      // === DIRECT RAW BYTE ACCESS ===
+      // Write input: copy Float32List bytes directly into the input tensor's raw Uint8List buffer.
+      final inputTensor = _interpreter!.getInputTensor(0);
+      final inputBytes = inputBuffer.buffer.asUint8List(
+        inputBuffer.offsetInBytes,
+        inputBuffer.lengthInBytes,
       );
+      inputTensor.data.setRange(0, inputBytes.length, inputBytes);
 
-      // RUN MODEL
-      _interpreter!.run(
-        input,
-        output,
-      );
+      // Invoke the interpreter.
+      _interpreter!.invoke();
 
-      List<double> probabilities =
-          List<double>.from(output[0]);
+      // Read output: copy raw bytes from output tensor and reinterpret as Float32List.
+      final outputTensor = _interpreter!.getOutputTensor(0);
+      final outputBytes = Uint8List.fromList(outputTensor.data);
+      final outputFloat32 = outputBytes.buffer.asFloat32List();
+      List<double> probabilities = outputFloat32.map((e) => e.toDouble()).toList();
 
-      // CARI MAX
-      double maxProb = 0.0;
-
-      int maxIndex = 0;
-
-      for (int i = 0;
-          i < probabilities.length;
-          i++) {
+      double maxProb = double.negativeInfinity;
+      int maxIndex = -1;
+      for (int i = 0; i < probabilities.length; i++) {
         if (probabilities[i] > maxProb) {
           maxProb = probabilities[i];
-
           maxIndex = i;
         }
       }
 
-      // THRESHOLD
-      if (maxProb > 0.5) {
-        predictedLabel.value =
-            _labels[maxIndex];
-
-        confidence.value = maxProb;
-      } else {
-        predictedLabel.value =
-            "Tidak dikenali";
-
+      if (maxIndex != -1 && maxIndex < _labels.length) {
+        predictedLabel.value = _labels[maxIndex];
         confidence.value = maxProb;
       }
-
-      print(
-        "Prediction: ${predictedLabel.value}",
-      );
-
-      print(
-        "Confidence: ${confidence.value}",
-      );
+      for (int i = 0; i < probabilities.length && i < _labels.length; i++) {
+        labelProbabilities[_labels[i]] = probabilities[i];
+      }
+      labelProbabilities.refresh();
     } catch (e) {
-      print("INFERENCE ERROR: $e");
-    } finally {
-      isInferencing = false;
+      predictedLabel.value = "Inference error: $e";
     }
   }
 }

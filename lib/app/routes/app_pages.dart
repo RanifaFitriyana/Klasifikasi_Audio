@@ -16,6 +16,11 @@ class AppPages {
 
   static final routes = [
     GetPage(
+      name: _Paths.HOME,
+      page: () => const HomeView(),
+      binding: HomeBinding(),
+    ),
+    GetPage(
       name: _Paths.UPLOAD_AUDIO,
       page: () => const UploadAudioView(),
       binding: UploadAudioBinding(),
@@ -24,11 +29,6 @@ class AppPages {
       name: _Paths.REALTIME_AUDIO,
       page: () => const RealtimeAudioView(),
       binding: RealtimeAudioBinding(),
-    ),
-    GetPage(
-      name: _Paths.HOME,
-      page: () => const HomeView(),
-      binding: HomeBinding(),
     ),
   ];
 }
